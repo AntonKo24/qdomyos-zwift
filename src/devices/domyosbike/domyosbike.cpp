@@ -856,42 +856,61 @@ resistance_t domyosbike::resistanceFromPowerRequest(uint16_t power) {
         return max_resistance;
 }
 
+namespace {
+
+/** Braking torque (Nm) per resistance level from the Bike 500 v2 profile. Index 0 = level 1. */
+constexpr double V2_TORQUE[] = {5.0,  5.7,  6.5,  7.5,  8.6,  9.9,  11.4, 13.6,
+                                15.3, 17.3, 19.8, 22.5, 25.6, 28.4, 35.9};
+
+constexpr int V2_LEVELS = (int)(sizeof(V2_TORQUE) / sizeof(V2_TORQUE[0]));
+
+/** Torque-to-power divisor: P[W] = T[Nm] * rpm * 2 * pi / 60, and 60 / (2 * pi) = 9.5488. */
+constexpr double TORQUE_TO_WATT_DIVISOR = 9.5488;
+
+/**
+ * Scales the whole torque ladder. The values above were measured on a Bike 500; a machine with a
+ * stronger brake reads low on every level, and watt_gain - the natural place to correct that - is
+ * capped at 2.0 for bikes in metric.cpp, which does not always cover the gap. Overridable through
+ * the "domyos_bike_500_torque_scale" setting.
+ */
+constexpr double V2_TORQUE_SCALE = 1.30;
+
+/**
+ * The v2 table holds one torque value per level, which makes power strictly linear in cadence.
+ * A generator or eddy-current brake develops more torque the faster it spins, so real power grows
+ * faster than linear and the plain table under-reads at high cadence. This exponent bends the
+ * curve back across the whole range: 0.0 reproduces the original v2 behaviour and 1.0 makes power
+ * fully quadratic in cadence (the physical ceiling for such a brake). Overridable through the
+ * "domyos_bike_500_cadence_exponent" setting.
+ */
+constexpr double V2_CADENCE_EXPONENT = 0.5;
+
+/**
+ * Fixed point of the exponent above: power at this cadence is the same whatever the exponent, so
+ * a calibration carried out around it survives changing the exponent. Note this anchor is not an
+ * independent knob - shifting it only rescales the curve, which [V2_TORQUE_SCALE] already does.
+ */
+constexpr double V2_REFERENCE_CADENCE = 70.0;
+
+} // namespace
+
 uint16_t domyosbike::wattsFromResistance(double resistance) {
     QSettings settings;
     if (settings.value(QZSettings::domyos_bike_500_profile_v2, QZSettings::default_domyos_bike_500_profile_v2).toBool()) {
-        switch ((int)resistance) {
-        case 1:
-            return (5.0 * Cadence.value()) / 9.5488;
-        case 2:
-            return (5.7 * Cadence.value()) / 9.5488;
-        case 3:
-            return (6.5 * Cadence.value()) / 9.5488;
-        case 4:
-            return (7.5 * Cadence.value()) / 9.5488;
-        case 5:
-            return (8.6 * Cadence.value()) / 9.5488;
-        case 6:
-            return (9.9 * Cadence.value()) / 9.5488;
-        case 7:
-            return (11.4 * Cadence.value()) / 9.5488;
-        case 8:
-            return (13.6 * Cadence.value()) / 9.5488;
-        case 9:
-            return (15.3 * Cadence.value()) / 9.5488;
-        case 10:
-            return (17.3 * Cadence.value()) / 9.5488;
-        case 11:
-            return (19.8 * Cadence.value()) / 9.5488;
-        case 12:
-            return (22.5 * Cadence.value()) / 9.5488;
-        case 13:
-            return (25.6 * Cadence.value()) / 9.5488;
-        case 14:
-            return (28.4 * Cadence.value()) / 9.5488;
-        case 15:
-            return (35.9 * Cadence.value()) / 9.5488;
-        }
-        return 0;
+        const double cadence = Cadence.value();
+        if (cadence <= 0)
+            return 0;
+
+        const int level = qBound(1, (int)resistance, V2_LEVELS);
+        const double scale =
+            settings.value(QStringLiteral("domyos_bike_500_torque_scale"), V2_TORQUE_SCALE).toDouble();
+        const double linearWatts = (V2_TORQUE[level - 1] * scale * cadence) / TORQUE_TO_WATT_DIVISOR;
+        const double exponent =
+            settings.value(QStringLiteral("domyos_bike_500_cadence_exponent"), V2_CADENCE_EXPONENT).toDouble();
+        if (exponent == 0.0)
+            return linearWatts;
+
+        return linearWatts * pow(cadence / V2_REFERENCE_CADENCE, exponent);
     } else if (!settings.value(QZSettings::domyos_bike_500_profile_v1, QZSettings::default_domyos_bike_500_profile_v1)
              .toBool() ||
         resistance < 8)
